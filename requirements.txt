@@ -1,1 +1,5 @@
 aiohttp
+httpx
+websockets
+python-socks
+socksio
