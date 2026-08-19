@@ -1,5 +1,5 @@
-aiohttp
-httpx
+httpxd
 websockets
 python-socks
 socksio
+starlette
