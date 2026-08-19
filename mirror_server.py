@@ -53,20 +53,72 @@ class MirrorServer:
 		# 获取请求 body（如果有）
 		body = await request.body()
 
-		# 发起上游请求
-		resp = await self.http_client.request(
+		# 1. 构建请求对象
+		timeout = httpx.Timeout(None, connect=60.0)
+		req = self.http_client.build_request(
 			method=request.method,
 			url=upstream_url,
 			headers=headers,
 			content=body if body else None,
-			follow_redirects=False,
+			timeout=timeout
 		)
 
-		return StreamingResponse(
-			resp.aiter_bytes(),
-			status_code=resp.status_code,
-			headers=dict(resp.headers),
+		# 2. 发送请求（stream=True 使响应体延迟读取）
+		#    连接超时 10s，读取超时设为 None（无限），以便流式可长期保持
+		resp = await self.http_client.send(req, stream=True)
+
+		# 3. 检查响应状态（若有异常，先关闭响应再抛出）
+		# try:
+		# 	resp.raise_for_status()
+		# except Exception:
+		# 	await resp.aclose()
+		# 	raise
+
+		# 4. 根据 Content-Type 决定处理方式
+		content_type = resp.headers.get("content-type", "").lower()
+		is_stream = any(
+			ct in content_type
+			for ct in ("application/x-ndjson", "text/event-stream")
 		)
+
+		if is_stream:
+			# print("is stream for", req.url, "content-type=", content_type)
+			# ------ 流式响应：直接转发，不限制读取 ------
+			async def stream_generator():
+				try:
+					async for chunk in resp.aiter_bytes():
+						yield chunk
+				finally:
+					await resp.aclose()   # 关闭连接，释放资源
+
+			return StreamingResponse(
+				stream_generator(),
+				status_code=resp.status_code,
+				headers=dict(resp.headers)
+			)
+		else:
+			# ------ 非流式响应：在有限超时内读取完整内容 ------
+			try:
+				# 应用 60 秒读取超时
+				data = await asyncio.wait_for(resp.aread(), timeout=60.0)
+			except asyncio.TimeoutError:
+				await resp.aclose()
+				raise httpx.ReadTimeout("读取上游响应超时（60s）")
+			except Exception:
+				await resp.aclose()
+				raise
+			else:
+				await resp.aclose()   # 读取完毕立即关闭
+
+			# 返回一个一次性产生完整数据的 StreamingResponse
+			async def content_iterator():
+				yield data
+
+			return StreamingResponse(
+				content_iterator(),
+				status_code=resp.status_code,
+				headers=dict(resp.headers)
+			)
 		
 	# ---------- WebSocket 双向转发 ----------
 	async def _all_ws_handler(self, websocket: WebSocket):
@@ -153,7 +205,7 @@ class MirrorServer:
 				pass
 
 	async def _startup(self):
-		self.http_client = httpx.AsyncClient(proxy=self.proxy, timeout=60.0)
+		self.http_client = httpx.AsyncClient(proxy=self.proxy)
 
 	async def _shutdown(self):
 		await self.http_client.aclose()
